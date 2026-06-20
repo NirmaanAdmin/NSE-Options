@@ -18,6 +18,7 @@ API contract. If Zerodha ever changes their login flow, this is the file
 that breaks.
 """
 import os
+import re
 import sys
 import logging
 import requests
@@ -110,7 +111,16 @@ def _step3_request_token(sess: requests.Session) -> str:
         raise RuntimeError(
             f"request_token not in redirect URL — got: {final[:300]}"
         )
-    token = final.split("request_token=")[1].split("&")[0].split("'")[0].split('"')[0]
+    # Use regex to stop at the first non-alphanumeric char. Splitting on
+    # `&`, `'`, `"` alone breaks when `final` is an exception string with
+    # the URL embedded inside parens/spaces (the requests.ConnectionError
+    # path) — the parser would grab e.g.
+    #   `hiO34tli1idM5THYovRbMUlgvc3LChqG (Caused by NewConnectionError(`
+    # which Kite then rejects as "Token is invalid or has expired."
+    m = re.search(r'request_token=([A-Za-z0-9]+)', final)
+    if not m:
+        raise RuntimeError(f"request_token regex match failed — got: {final[:300]}")
+    token = m.group(1)
     log.info(f"Step 3 OK: extracted request_token ({len(token)} chars)")
     return token
 
