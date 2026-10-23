@@ -21,8 +21,10 @@ Expiry selection:
 """
 import os
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
+
+import pytz
 
 from instruments import chain_for
 
@@ -45,7 +47,7 @@ def pick_option(kite_client, underlying: str, spot: float, side: str) -> dict:
         raise ValueError(f"spot must be positive, got {spot}")
 
     opt_type = "CE" if side == "buy" else "PE"
-    today = date.today()
+    today = datetime.now(pytz.timezone("Asia/Kolkata")).date()
 
     candidates = chain_for(kite_client, underlying, opt_type)
     candidates = [c for c in candidates if c.get("expiry") and c["expiry"] >= today]

@@ -21,7 +21,7 @@ from datetime import date
 
 log = logging.getLogger("kite.instruments")
 
-_cache = {"data": [], "ts": 0.0}
+_cache = {"data": [], "ts": 0.0, "by_tsym": {}}
 _TTL = 6 * 3600  # 6 hours
 
 
@@ -32,6 +32,7 @@ def load(kite_client, force: bool = False) -> list:
     log.info("Fetching NFO instruments dump from Kite...")
     rows = kite_client.instruments("NFO")
     _cache["data"] = rows
+    _cache["by_tsym"] = {r.get("tradingsymbol"): r for r in rows}
     _cache["ts"] = time.time()
     opts = sum(1 for r in rows if r.get("segment") == "NFO-OPT")
     futs = sum(1 for r in rows if r.get("segment") == "NFO-FUT")
@@ -70,3 +71,9 @@ def list_underlyings(kite_client) -> list:
         if r.get("segment") == "NFO-OPT" and r.get("name")
     }
     return sorted(names)
+
+
+def by_tradingsymbol(kite_client, tradingsymbol: str):
+    """Instrument row for an NFO tradingsymbol, or None."""
+    load(kite_client)
+    return _cache["by_tsym"].get(tradingsymbol)

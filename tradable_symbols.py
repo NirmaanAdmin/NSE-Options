@@ -122,3 +122,35 @@ def spot_ltp_key(underlying: str) -> str:
     if underlying in INDEX_SPOT_SYMBOL:
         return INDEX_SPOT_SYMBOL[underlying]
     return f"NSE:{underlying}"
+
+
+# ─── TradingView ticker → Kite underlying ──────────────────────────────
+# TradingView writes NSE symbols with '_' where NSE uses '-' or '&'
+# (BAJAJ_AUTO, M_M) and uses its own names for some indices. Continuous
+# futures charts append '1!' / '2!'. Everything below folds those onto the
+# Kite `instruments.name` used by the option chain.
+TV_INDEX_ALIASES = {
+    "NIFTY": "NIFTY", "NIFTY50": "NIFTY", "NIFTY_50": "NIFTY", "CNXNIFTY": "NIFTY",
+    "BANKNIFTY": "BANKNIFTY", "NIFTYBANK": "BANKNIFTY", "NIFTY_BANK": "BANKNIFTY",
+    "CNXFINANCE": "FINNIFTY", "FINNIFTY": "FINNIFTY", "NIFTY_FIN_SERVICE": "FINNIFTY",
+    "NIFTY_MID_SELECT": "MIDCPNIFTY", "MIDCPNIFTY": "MIDCPNIFTY", "NIFTYMIDSELECT": "MIDCPNIFTY",
+    "NIFTYJR": "NIFTYNXT50", "NIFTYNXT50": "NIFTYNXT50", "NIFTY_NEXT_50": "NIFTYNXT50",
+    "NIFTYNEXT50": "NIFTYNXT50",
+}
+
+
+def resolve_underlying(raw: str):
+    """'NSE:BAJAJ_AUTO' / 'BAJAJ_AUTO' / 'HAVELLS1!' / 'NSE:CNXFINANCE' /
+    'HAVELLS-EQ' → canonical whitelist name, or None if not tradable."""
+    s = (raw or "").strip().upper()
+    if ":" in s:
+        s = s.split(":", 1)[1]
+    s = s.replace("-EQ", "").strip()
+    while s.endswith("!") and len(s) > 2 and s[-2].isdigit():
+        s = s[:-2]
+    if s in TV_INDEX_ALIASES:
+        return TV_INDEX_ALIASES[s]
+    for cand in (s, s.replace("_", "-"), s.replace("_", "&")):
+        if cand in TRADABLE_UNDERLYINGS:
+            return cand
+    return None

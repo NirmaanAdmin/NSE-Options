@@ -39,6 +39,16 @@ TOTP_SECRET = os.environ.get("KITE_TOTP_SECRET", "")
 TOKEN_PATH  = os.environ.get("ACCESS_TOKEN_PATH", "/app/data/kite_access_token.txt")
 
 
+def _proxies():
+    """Login through the same static-IP proxy as orders (consistent source IP
+    avoids repeated new-IP CAPTCHA / security prompts on kite.zerodha.com)."""
+    for k in ("KITE_PROXY_URL", "QUOTAGUARDSHIELD_URL", "QUOTAGUARDSTATIC_URL", "FIXIE_URL"):
+        v = os.environ.get(k, "").strip()
+        if v:
+            return {"http": v, "https": v}
+    return None
+
+
 def _check_env():
     missing = [
         k for k, v in [
@@ -129,11 +139,14 @@ def refresh() -> str:
     """Full refresh flow. Returns the new access_token and writes it to TOKEN_PATH."""
     _check_env()
     sess = requests.Session()
+    px = _proxies()
+    if px:
+        sess.proxies.update(px)
     request_id = _step1_password_login(sess)
     _step2_totp(sess, request_id)
     request_token = _step3_request_token(sess)
 
-    kite = KiteConnect(api_key=API_KEY)
+    kite = KiteConnect(api_key=API_KEY, proxies=px)
     data = kite.generate_session(request_token, api_secret=API_SECRET)
     access_token = data["access_token"]
 

@@ -25,6 +25,11 @@ log = logging.getLogger("kite.sizer")
 EQUITY_PCT = float(os.environ.get("EQUITY_PCT_PER_TRADE", "20.0")) / 100.0
 LOTS_MIN   = int(os.environ.get("NUM_LOTS_MIN", "1"))
 LOTS_MAX   = int(os.environ.get("NUM_LOTS_MAX", "100"))
+# Fixed premium budget per trade (INR). > 0 overrides EQUITY_PCT_PER_TRADE —
+# same role as FIXED_MARGIN_INR on the CoinDCX server. The order is still
+# refused if available cash cannot cover the computed premium + buffer.
+FIXED_PREMIUM_INR = float(os.environ.get("FIXED_PREMIUM_INR", "0"))
+CASH_BUFFER_INR   = float(os.environ.get("CASH_BUFFER_INR", "100"))
 
 
 def get_available_equity(kite_client) -> float:
@@ -67,14 +72,20 @@ def size_position(kite_client, option_ltp: float, lot_size: int) -> int:
         log.error("Available equity is 0 — cannot size")
         return 0
 
-    budget = equity * EQUITY_PCT
+    budget = FIXED_PREMIUM_INR if FIXED_PREMIUM_INR > 0 else equity * EQUITY_PCT
     per_lot_cost = option_ltp * lot_size
     lots_raw = budget / per_lot_cost
     lots = int(math.floor(lots_raw))
+    # Never spend more than the cash actually available (minus buffer)
+    afford = int(math.floor(max(0.0, equity - CASH_BUFFER_INR) / per_lot_cost))
+    if lots > afford:
+        log.warning(f"Sizer: budget wants {lots} lots but cash affords {afford}")
+        lots = afford
 
     log.info(
         f"Sizer: equity=₹{equity:,.0f} budget=₹{budget:,.0f} "
-        f"per_lot=₹{per_lot_cost:,.0f} → {lots_raw:.2f} → floor {lots} lots"
+        f"({'fixed' if FIXED_PREMIUM_INR > 0 else f'{EQUITY_PCT*100:.0f}%'}) "
+        f"per_lot=₹{per_lot_cost:,.0f} → {lots_raw:.2f} → {lots} lots"
     )
 
     lots = min(lots, LOTS_MAX)
