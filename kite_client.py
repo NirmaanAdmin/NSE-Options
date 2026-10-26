@@ -31,7 +31,10 @@ TOKEN_PATH = os.environ.get("ACCESS_TOKEN_PATH", "/app/data/kite_access_token.tx
 
 # Order behaviour
 ORDER_TYPE        = os.environ.get("ORDER_TYPE", "LIMIT").strip().upper()   # LIMIT | MARKET
-LIMIT_BUFFER_PCT  = float(os.environ.get("LIMIT_BUFFER_PCT", "2.0"))        # marketable-limit buffer
+# LIMIT orders are priced off the ORDER BOOK, not the last trade:
+#   BUY  at best ask × (1 + buffer)   SELL at best bid × (1 − buffer)
+# (rounded away from the touch to the tick, so the order always crosses).
+LIMIT_BUFFER_PCT  = float(os.environ.get("LIMIT_BUFFER_PCT", "1.0"))
 MARKET_PROTECTION = float(os.environ.get("MARKET_PROTECTION", "-1"))        # -1 = Kite auto; 1..100 = %
 ORDER_TAG         = os.environ.get("ORDER_TAG", "zsc_opt")[:20]
 ALGO_ID           = os.environ.get("KITE_ALGO_ID", "").strip() or None
@@ -117,12 +120,35 @@ class KiteClient:
             return False
 
     # ─── Orders ──────────────────────────────────────────────────────
+    def best_bid_ask(self, tradingsymbol: str, exchange: str = "NFO"):
+        """(bid, ask, ltp) from the live order book. bid/ask are 0.0 when that
+        side of the book is empty. Returns None on API failure."""
+        key = f"{exchange}:{tradingsymbol}"
+        try:
+            q = (self._call(self.kite.quote, [key]) or {}).get(key) or {}
+        except Exception as e:
+            log.error(f"quote({key}) failed: {e}")
+            return None
+        depth = q.get("depth") or {}
+
+        def _top(side):
+            for lvl in depth.get(side) or []:
+                px = float(lvl.get("price", 0) or 0)
+                if px > 0 and int(lvl.get("quantity", 0) or 0) > 0:
+                    return px
+            return 0.0
+        return _top("buy"), _top("sell"), float(q.get("last_price", 0) or 0)
+
     def place_order(self, tradingsymbol: str, transaction_type: str, quantity: int,
                     product: str = "NRML", exchange: str = "NFO",
-                    ref_price: Optional[float] = None, tick: float = 0.05) -> str:
-        """MARKET (with market_protection) or marketable LIMIT around ref_price.
-        LIMIT falls back to MARKET when no usable ref_price is available."""
-        otype = ORDER_TYPE
+                    ref_price: Optional[float] = None, tick: float = 0.05,
+                    bid: Optional[float] = None, ask: Optional[float] = None) -> str:
+        """LIMIT (default): priced off the order book — BUY at ask + buffer,
+        SELL at bid − buffer, tick-rounded so it crosses the spread. Book
+        fetched here unless bid/ask are passed. Empty book side → LTP ± buffer
+        (ref_price) → MARKET as the last resort.
+        MARKET: market order with mandatory market_protection."""
+        buy = transaction_type == "BUY"
         kw = dict(
             variety=self.kite.VARIETY_REGULAR,
             exchange=exchange,
@@ -135,13 +161,27 @@ class KiteClient:
         )
         if ALGO_ID:
             kw["algo_id"] = ALGO_ID
-        if otype == "LIMIT" and ref_price and ref_price > 0:
-            buy = transaction_type == "BUY"
-            raw = ref_price * (1 + LIMIT_BUFFER_PCT / 100.0) if buy \
-                else ref_price * (1 - LIMIT_BUFFER_PCT / 100.0)
+        price, desc = None, ""
+        if ORDER_TYPE == "LIMIT":
+            if bid is None or ask is None:
+                bba = self.best_bid_ask(tradingsymbol, exchange)
+                if bba:
+                    bid, ask, ltp = bba
+                    ref_price = ref_price or ltp
+            touch = (ask if buy else bid) or 0.0
+            if touch > 0:
+                raw = touch * (1 + LIMIT_BUFFER_PCT / 100.0) if buy \
+                    else touch * (1 - LIMIT_BUFFER_PCT / 100.0)
+                price = round_to_tick(raw, tick, up=buy)
+                desc = f"LMT {price} ({'ask' if buy else 'bid'} {touch} ±{LIMIT_BUFFER_PCT}%)"
+            elif ref_price and ref_price > 0:
+                raw = ref_price * (1 + LIMIT_BUFFER_PCT / 100.0) if buy \
+                    else ref_price * (1 - LIMIT_BUFFER_PCT / 100.0)
+                price = round_to_tick(raw, tick, up=buy)
+                desc = f"LMT {price} (no {'ask' if buy else 'bid'} in book — LTP {ref_price} ±{LIMIT_BUFFER_PCT}%)"
+        if price is not None:
             kw["order_type"] = self.kite.ORDER_TYPE_LIMIT
-            kw["price"] = round_to_tick(raw, tick, up=buy)
-            desc = f"LMT {kw['price']} (ref {ref_price} ±{LIMIT_BUFFER_PCT}%)"
+            kw["price"] = price
         else:
             kw["order_type"] = self.kite.ORDER_TYPE_MARKET
             mp = MARKET_PROTECTION if MARKET_PROTECTION != 0 else -1
