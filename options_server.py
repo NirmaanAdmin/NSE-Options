@@ -1,6 +1,6 @@
 """
-server.py
-─────────
+options_server.py
+─────────────────
 Zerodha (Kite Connect) OPTIONS executor for the TradingView chassis fleet.
 Same contract and safety model as the CoinDCX `server2.py`; the instrument
 is a long ITM option on the underlying (buy → CE, sell → PE), NRML carry.
@@ -88,7 +88,22 @@ def _env_bool(k, d):
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "")
 PRODUCT          = os.environ.get("KITE_PRODUCT", "NRML").strip().upper()
 
-# Ladder (server-owned exits) — all % on the UNDERLYING SPOT
+# Exit mode
+#   single (default): ONE take-profit closes the whole position — no books,
+#                     no trailing. TP_PCT measured on TP_BASIS:
+#                       premium → option premium ≥ entry premium × (1 + TP_PCT%)
+#                       spot    → underlying moved TP_PCT% in the trade's favour
+#                     Stops unchanged: spot SL (SL_PCT, fixed) + premium backstop.
+#   ladder          : the server2 ladder (TP_STEP_PCT rungs, books, trailing SL).
+EXIT_MODE        = os.environ.get("EXIT_MODE", "single").strip().lower()
+TP_PCT           = float(os.environ.get("TP_PCT", "15.0"))
+TP_BASIS         = os.environ.get("TP_BASIS", "premium").strip().lower()
+
+# Liquidity guard: skip ENTRIES whose bid/ask spread exceeds this % of mid.
+# Exits are never blocked by it. 0 = off.
+MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT", "10.0"))
+
+# Ladder (EXIT_MODE=ladder) — all % on the UNDERLYING SPOT
 EXIT_POLL_SEC    = float(os.environ.get("EXIT_POLL_SEC", "5"))
 SL_PCT           = float(os.environ.get("SL_PCT", "3.0"))
 TP_STEP_PCT      = float(os.environ.get("TP_STEP_PCT", "4.0"))
@@ -142,6 +157,24 @@ FLATTEN_FILE        = os.environ.get("DAILY_FLATTEN_FILE", f"{DATA_DIR}/daily_fl
 
 MKT_OPEN_HM  = (9, 15)
 MKT_CLOSE_HM = (15, 30)
+
+# Entry window start — NO entry (fresh or flip) before this IST time.
+# Exits (ladder, locks, Pine close, expiry) are unaffected and run from 09:15.
+ENTRY_START_TIME = os.environ.get("ENTRY_START_TIME", "09:20").strip()
+
+
+def _parse_hm(s: str, default):
+    try:
+        h, m = s.split(":")
+        h, m = int(h), int(m)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except Exception:
+        pass
+    return default
+
+
+ENTRY_START_HM = _parse_hm(ENTRY_START_TIME, (9, 20))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -593,8 +626,13 @@ def close_position(u: str, reason: str = "", ref_price: Optional[float] = None,
 # ═══════════════════════════════════════════════════════════════════════
 #  LADDER — server-owned exits on SPOT
 # ═══════════════════════════════════════════════════════════════════════
+def _fmt(x) -> str:
+    return "off" if x is None else f"{x:.2f}"
+
+
 def _spot_sl_price(side: str, e: float) -> Optional[float]:
-    if not e or e <= 0:
+    """Initial spot stop. SL_PCT <= 0 → no spot stop at all (None)."""
+    if not e or e <= 0 or SL_PCT <= 0:
         return None
     return e * (1 - SL_PCT / 100.0) if side == "buy" else e * (1 + SL_PCT / 100.0)
 
@@ -639,11 +677,11 @@ def _ladder_step(u: str, spot: float, opt: float):
         if e <= 0 or spot <= 0 or int(t.get("lots_remaining", 0)) <= 0:
             return
         cur_sl = t.get("ladder_sl_spot")
-        if cur_sl is None:
+        if cur_sl is None and SL_PCT > 0:
             cur_sl = _spot_sl_price(side, e)
             t["ladder_sl_spot"] = cur_sl
             _save_active_trades()
-            log.info(f"🪜 LADDER armed: {u} {side.upper()} spot_entry={e} SL0={cur_sl:.2f}")
+            log.info(f"🪜 LADDER armed: {u} {side.upper()} spot_entry={e} SL0={_fmt(cur_sl)}")
         books = int(t.get("ladder_books", 0))
         orig_lots = int(t.get("lots_total", t["lots_remaining"]))
 
@@ -660,18 +698,36 @@ def _ladder_step(u: str, spot: float, opt: float):
         # 2. spot SL / trail
         if _spot_sl_breached(side, spot, cur_sl):
             reason = "spot_sl" if books == 0 else "trail_sl"
-            log.warning(f"🛡️ LADDER STOP {u} {side.upper()} spot={spot} SL={cur_sl:.2f} books={books}")
+            log.warning(f"🛡️ LADDER STOP {u} {side.upper()} spot={spot} SL={_fmt(cur_sl)} books={books}")
             if close_position(u, reason, ref_price=opt) and u not in active_trades:
                 mark_sl_lockout(u, f"{reason} @ {spot}")
                 _ladder_closes += 1
             return
 
-        # 3. books + ratchet
+        # 3a. single take-profit — close everything, no books, no trail
+        if EXIT_MODE != "ladder":
+            if TP_PCT <= 0:
+                return
+            if TP_BASIS == "spot":
+                gain = ((spot - e) / e if side == "buy" else (e - spot) / e) * 100
+            else:
+                gain = (opt / pe - 1) * 100 if pe > 0 and opt > 0 else 0.0
+            if LADDER_VERBOSE:
+                log.info(f"🎯 {u} {side} {TP_BASIS} gain {gain:+.2f}% / TP {TP_PCT}% "
+                         f"(spot {spot}, opt {opt}, entry prem {pe}, SL {_fmt(cur_sl)})")
+            if gain >= TP_PCT:
+                log.info(f"🎯 TAKE PROFIT {u}: {TP_BASIS} +{gain:.2f}% ≥ {TP_PCT}% — closing all")
+                if close_position(u, "take_profit", ref_price=opt) and u not in active_trades:
+                    log_trade_event(u, "sell", "take_profit", "FILLED", f"{TP_BASIS} +{gain:.2f}%")
+                    _ladder_closes += 1
+            return
+
+        # 3b. ladder: books + ratchet
         k = _rungs_crossed(side, spot, e)
         if LADDER_VERBOSE:
             prof = ((spot - e) / e if side == "buy" else (e - spot) / e) * 100
             log.info(f"🪜 {u} {side} spot={spot} prof={prof:+.2f}% k={k} books={books}/{MAX_BOOKS} "
-                     f"sl={cur_sl:.2f} opt={opt} (entry {pe})")
+                     f"sl={_fmt(cur_sl)} opt={opt} (entry {pe})")
         target_books = min(MAX_BOOKS, k)
         while books < target_books and u in active_trades:
             t = active_trades[u]
@@ -697,7 +753,7 @@ def _ladder_step(u: str, spot: float, opt: float):
             return
         new_sl = _ratchet_sl(side, cur_sl, _ladder_sl_target(side, e, k))
         if new_sl is not None and new_sl != cur_sl:
-            log.info(f"🪜 TRAIL {u}: SL {cur_sl:.2f} → {new_sl:.2f} (k={k}, books={books})")
+            log.info(f"🪜 TRAIL {u}: SL {_fmt(cur_sl)} → {_fmt(new_sl)} (k={k}, books={books})")
             t["ladder_sl_spot"] = new_sl
             _save_active_trades()
 
@@ -1003,10 +1059,25 @@ def _open_position(u: str, action: str, pine_price: float) -> dict:
         return {"status": "rejected", "reason": f"resolver: {e}"}
     tsym, lot = c["tradingsymbol"], int(c["lot_size"])
     tick = _f(c.get("tick_size"), 0.05)
-    okey = f"NFO:{tsym}"
-    prem = kite.bulk_ltp([okey]).get(okey, 0.0)
-    if prem <= 0:
-        return {"status": "rejected", "reason": f"no premium LTP for {tsym}"}
+    bba = kite.best_bid_ask(tsym)
+    if bba is None:
+        return {"status": "rejected", "reason": f"no quote for {tsym}"}
+    bid, ask, ltp = bba
+    if ask <= 0:
+        log_trade_event(u, action, "entry", "SKIP", f"{tsym}: no sellers in book")
+        return {"status": "skipped", "reason": f"{tsym}: no sellers in the order book"}
+    if MAX_SPREAD_PCT > 0:
+        if bid <= 0:
+            log_trade_event(u, action, "entry", "SKIP", f"{tsym}: no buyers in book")
+            return {"status": "skipped",
+                    "reason": f"{tsym}: no buyers in the order book (could not exit)"}
+        spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
+        if spread_pct > MAX_SPREAD_PCT:
+            log.info(f"🚧 SKIP {u}: {tsym} spread {bid}/{ask} = {spread_pct:.1f}% > {MAX_SPREAD_PCT}%")
+            log_trade_event(u, action, "entry", "SKIP", f"spread {spread_pct:.1f}%")
+            return {"status": "skipped",
+                    "reason": f"{tsym} spread {spread_pct:.1f}% > MAX_SPREAD_PCT {MAX_SPREAD_PCT}%"}
+    prem = ask   # what a buy actually pays — used for sizing and as the fallback fill
 
     lots = size_position(kite, prem, lot)
     if lots <= 0:
@@ -1014,7 +1085,8 @@ def _open_position(u: str, action: str, pine_price: float) -> dict:
         return {"status": "skipped", "reason": "insufficient cash (calc < 1 lot)"}
     qty = lots * lot
     try:
-        oid = kite.place_order(tsym, "BUY", qty, product=PRODUCT, ref_price=prem, tick=tick)
+        oid = kite.place_order(tsym, "BUY", qty, product=PRODUCT, ref_price=ltp or prem,
+                               tick=tick, bid=bid, ask=ask)
     except Exception as e:
         log.error(f"❌ BUY {tsym} failed: {e}")
         log_trade_event(u, action, "entry", "REJECT", str(e)[:200])
@@ -1060,6 +1132,10 @@ def _entry_gate_reason(u: str) -> Optional[str]:
     """Global/per-symbol gates for ENTRY only. Closes are never gated."""
     if not market_open():
         return "market closed"
+    n = now_ist()
+    start = n.replace(hour=ENTRY_START_HM[0], minute=ENTRY_START_HM[1], second=0, microsecond=0)
+    if n < start:
+        return f"before entry start {ENTRY_START_HM[0]:02d}:{ENTRY_START_HM[1]:02d} IST"
     if daily_cap_active():
         return f"daily cap ({_daily_locked_pct_sum:.2f}% ≥ {DAILY_CAP_PCT}%)"
     if in_flatten_cooldown():
@@ -1251,7 +1327,10 @@ def status():
         "reconcile": {"enabled": RECONCILE_ENABLED, "adopt": RECONCILE_ADOPT, **_reconcile},
         "ladder": {"last_check": _ladder_last_check_at, "last_error": _ladder_last_error,
                    "closes": _ladder_closes},
-        "config": {"product": PRODUCT, "order_type": kc.ORDER_TYPE,
+        "config": {"product": PRODUCT,
+                   "entry_start_ist": f"{ENTRY_START_HM[0]:02d}:{ENTRY_START_HM[1]:02d}",
+                   "exit_mode": EXIT_MODE, "TP_PCT": TP_PCT, "TP_BASIS": TP_BASIS,
+                   "MAX_SPREAD_PCT": MAX_SPREAD_PCT, "order_type": kc.ORDER_TYPE,
                    "limit_buffer_pct": kc.LIMIT_BUFFER_PCT, "market_protection": kc.MARKET_PROTECTION,
                    "static_ip_proxy": bool(kc.proxy_url()), "SL_PCT": SL_PCT,
                    "TP_STEP_PCT": TP_STEP_PCT, "BOOK_PCT": BOOK_PCT, "MAX_BOOKS": MAX_BOOKS,
@@ -1377,10 +1456,19 @@ def boot():
     log.info("=" * 70)
     log.info(" ZERODHA OPTIONS — server2 contract | server-owned exits | NRML ")
     log.info("=" * 70)
+    if EXIT_MODE != "ladder":
+        log.info(f"Exits: SINGLE TP {TP_PCT}% on {TP_BASIS} · spot SL {SL_PCT}% (fixed) · "
+                 f"premium SL {PREMIUM_SL_PCT}% · no books")
+    log.info(f"Entry spread cap {MAX_SPREAD_PCT}% · LIMIT orders off the order book ±{kc.LIMIT_BUFFER_PCT}%")
+    if SL_PCT <= 0:
+        log.warning("⚠️ SL_PCT=0 — NO spot stop-loss. Positions exit only on TP, premium SL, "
+                    "locks, Pine close, expiry guard or manual close.")
     log.info(f"Ladder SL={SL_PCT}% TP_STEP={TP_STEP_PCT}% BOOK={BOOK_PCT}%×{MAX_BOOKS} "
              f"PREMIUM_SL={PREMIUM_SL_PCT}% poll={EXIT_POLL_SEC}s")
     log.info(f"Orders {kc.ORDER_TYPE} (buffer {kc.LIMIT_BUFFER_PCT}%, protection "
              f"{kc.MARKET_PROTECTION}) product={PRODUCT} proxy={'yes' if kc.proxy_url() else 'NO'}")
+    log.info(f"Entries accepted from {ENTRY_START_HM[0]:02d}:{ENTRY_START_HM[1]:02d} IST "
+             f"(exits from {MKT_OPEN_HM[0]:02d}:{MKT_OPEN_HM[1]:02d})")
     log.info(f"Whitelist {len(TRADABLE_UNDERLYINGS)} ({len(INDEX_UNDERLYINGS)} indices) "
              f"MAX_POSITIONS={MAX_POSITIONS}")
     _daily_counter_date = now_ist().date()
